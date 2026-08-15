@@ -1,0 +1,18 @@
+# Self-test: run the bundled example plugin's suite through the composite
+# action itself (uses: ./). Gates PRs and main so a release PR never ships
+# a broken runner.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          plugin-dir: examples/hello-wc-runner

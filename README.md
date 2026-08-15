@@ -150,8 +150,20 @@ a matrix:
 ```
 
 Inputs: `plugin-dir` (default `.`), `plugins`, `wc-version`, `wp-version`,
-`php-version` (default `8.3`), `phpunit-args`. Pin the action to a tag
-(`@v1`) — tag this repo when the contract changes.
+`php-version` (default `8.3`), `phpunit-args`. Pin the action to the
+floating major tag (`@v1`).
+
+## Releases
+
+Releases are fully automated with
+[release-please](https://github.com/googleapis/release-please): commits on
+`main` follow [Conventional Commits](https://www.conventionalcommits.org/),
+release-please keeps a release PR open with the pending version bump and
+[Keep a Changelog](https://keepachangelog.com/)-style `CHANGELOG.md` entry,
+and merging that PR tags `vX.Y.Z`, publishes the GitHub release, and moves
+the `v1` tag. `feat:` bumps minor, `fix:`/`perf:`/`refactor:` bump patch,
+and a `!` (breaking) commit bumps major — use `!` for any change to the
+action inputs or the plugin repo contract.
 
 ## Out of scope
 

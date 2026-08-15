@@ -58,6 +58,22 @@ checking the generated override without spinning up containers, e.g.:
 WC_RUNNER_DRY_RUN=1 ./wc-runner -d examples/hello-wc-runner
 ```
 
+## Commits and releases
+
+- Commit messages MUST follow [Conventional Commits](https://www.conventionalcommits.org/):
+  `feat:`, `fix:`, `perf:`, `refactor:`, `docs:`, `ci:`, `chore:`, `test:`,
+  `build:`, `revert:`, `security:`, `deprecate:`. Breaking changes to the
+  action inputs or the plugin-repo test contract use `!` (e.g. `feat!:`)
+  and produce a new major.
+- Releases are fully automated by release-please
+  (`.github/workflows/release-please.yml`): it maintains a release PR from
+  the commits on `main`; merging that PR bumps `version.txt`, updates
+  `CHANGELOG.md` (Keep a Changelog sections), tags `vX.Y.Z`, publishes the
+  GitHub release, and re-points the floating `v1` tag.
+- Never hand-edit released `CHANGELOG.md` sections, `version.txt`,
+  `.release-please-manifest.json`, or move tags manually — release-please
+  owns all of them.
+
 ## Common tasks
 
 ```sh

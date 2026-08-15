@@ -1,0 +1,38 @@
+# Fully automated releases: release-please reads Conventional Commits on
+# main, maintains a release PR with the version bump + CHANGELOG.md entry
+# (Keep a Changelog sections, mapped in release-please-config.json), and on
+# merge tags vX.Y.Z and publishes the GitHub release. The last step then
+# re-points the floating major tag (v1) that action consumers pin to.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created }}
+
+      - name: Move the floating major tag
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          MAJOR: ${{ steps.release.outputs.major }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "v${MAJOR}" "${TAG}"
+          git push -f origin "v${MAJOR}"
