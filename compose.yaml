@@ -1,0 +1,103 @@
+name: woocommerce-runner
+
+services:
+  db:
+    image: mariadb:latest
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      # Fixed, throwaway credential — also hardcoded in the test service
+      # (run-plugin-tests.sh needs root to create wordpress_test) and in
+      # wp-tests-config.php.tpl. Keep all three in sync if this changes.
+      MARIADB_ROOT_PASSWORD: wc-runner
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Storage stanza (tmpfs by default, a named volume with --persist) is
+    # appended by wc-runner's generated override — never set here.
+
+  wordpress:
+    build:
+      context: ./docker
+      args:
+        # Full base-image tag, computed by wc-runner from --wp-version /
+        # --php-version. Passed whole rather than assembled inside the
+        # Dockerfile, so the "omitted --wp-version means latest" tag-shape
+        # difference lives in one place.
+        WP_BASE: ${WP_BASE:-wordpress:php8.3-apache}
+    image: woocommerce-runner:wp${WP_VERSION:-latest}-php${PHP_VERSION:-8.3}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      # Read by seed.sh, not by the stock wordpress entrypoint.
+      WC_RUNNER_WC_VERSION: ${WC_RUNNER_WC_VERSION:-}
+      WC_RUNNER_PLUGINS: ${WC_RUNNER_PLUGINS:-}
+      WC_RUNNER_WITH_CACHE: ${WC_RUNNER_WITH_CACHE:-0}
+      WC_RUNNER_PORT: ${WC_RUNNER_PORT:-8080}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/wp-login.php"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - wp-data:/var/www/html
+    # ports and plugin read-only binds are appended by the generated
+    # override — kept out of the base file so a --port change never
+    # collides with a stale mapping left over from a prior run.
+
+  valkey:
+    image: valkey/valkey:latest
+    profiles: ["cache"]
+
+  test:
+    build:
+      context: ./docker
+      args:
+        WP_BASE: ${WP_BASE:-wordpress:php8.3-apache}
+    image: woocommerce-runner:wp${WP_VERSION:-latest}-php${PHP_VERSION:-8.3}
+    profiles: ["test"]
+    depends_on:
+      db:
+        condition: service_healthy
+    user: www-data
+    entrypoint: ["/opt/wc-runner/run-plugin-tests.sh"]
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: wc-runner
+      WC_RUNNER_WC_VERSION: ${WC_RUNNER_WC_VERSION:-}
+      # WC_RUNNER_PLUGINS is deliberately NOT set here: plugins are only
+      # mounted under /mnt/plugins-src in this service, so seed.sh must not
+      # try to activate them — wp-phpunit loads the plugin from the work
+      # copy on muplugins_loaded instead.
+      WC_RUNNER_PORT: ${WC_RUNNER_PORT:-8080}
+      COMPOSER_CACHE_DIR: /opt/wc-runner/.composer-cache
+    volumes:
+      - wp-data:/var/www/html
+      - composer-cache:/opt/wc-runner/.composer-cache
+    tmpfs:
+      # Writable copy of the plugin under test; uid/gid 33 is www-data on
+      # the Debian-based wordpress image. "exec" is required — Docker
+      # mounts tmpfs noexec by default, which would break vendor/bin/phpunit.
+      - /opt/wc-runner/work:exec,uid=33,gid=33,size=512m
+    # Plugin read-only binds under /mnt/plugins-src/<name> are appended by
+    # the generated override.
+
+volumes:
+  # Extracted WordPress core + downloaded WooCommerce, shared by wordpress
+  # and test. Warm boots skip the ~90s extract/download.
+  wp-data:
+  composer-cache:
+  # Only mounted when wc-runner is run with --persist (see the generated
+  # override); declared here so compose can create it on demand.
+  db-data:

@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""Disposable Docker-based WooCommerce environment for validating plugins.
+
+Default action runs a plugin's PHPUnit suite and exits with the propagated
+result — like odoo-runner's odoo-bin passthrough, the exit code IS the
+answer, never parse the log. --demo boots a throwaway, fully seeded store
+for manual QA instead. See README.md for the full flag reference and the
+plugin-repo test contract.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+COMPOSE_FILE = REPO_ROOT / "compose.yaml"
+
+PLUGIN_HEADER_RE = re.compile(rb"^[ \t/*#@]*Plugin Name:", re.IGNORECASE | re.MULTILINE)
+HEADER_SCAN_BYTES = 8192
+
+README_CONTRACT_POINTER = "see README.md § Plugin repo contract"
+
+
+class ValidationError(Exception):
+    """A plugin dir (or flag combination) failed validation before Docker ran."""
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    d = Path(base) / "woocommerce-runner"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def override_path() -> Path:
+    return state_dir() / "override.yaml"
+
+
+def state_file_path() -> Path:
+    return state_dir() / "state.json"
+
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+
+def split_passthrough(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split argv on the first bare "--" (phpunit passthrough args)."""
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i], argv[i + 1 :]
+    return argv, []
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wc-runner",
+        description=__doc__.splitlines()[0],
+        epilog=(
+            "Args after `--` pass straight to phpunit (default test mode only). "
+            "Set WC_RUNNER_DRY_RUN=1 to print the docker compose command instead "
+            "of running it."
+        ),
+    )
+    parser.add_argument(
+        "-d",
+        "--plugin-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="path to a plugin directory (repeatable)",
+    )
+    parser.add_argument(
+        "-p",
+        "--plugins",
+        action="append",
+        default=[],
+        metavar="DIR1,DIR2,...",
+        help="comma-separated plugin directory paths (repeatable, merges with -d)",
+    )
+    parser.add_argument(
+        "-V",
+        "--wc-version",
+        metavar="VER",
+        help="WooCommerce version to pin (default: latest)",
+    )
+    parser.add_argument(
+        "--wp-version",
+        metavar="VER",
+        help="WordPress core version (default: latest)",
+    )
+    parser.add_argument(
+        "--php-version",
+        default="8.3",
+        metavar="VER",
+        help="PHP version for the base image (default: 8.3)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="host port for the store (default: 8080)",
+    )
+    parser.add_argument(
+        "--with-cache",
+        action="store_true",
+        help="start a Valkey object cache alongside the store",
+    )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="keep the database in a named volume instead of tmpfs",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt for --destroy",
+    )
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--demo",
+        action="store_true",
+        help="boot the seeded browsable store instead of running tests",
+    )
+    mode.add_argument(
+        "--down",
+        action="store_true",
+        help="stop containers, keep named volumes",
+    )
+    mode.add_argument(
+        "--destroy",
+        action="store_true",
+        help="stop containers and delete all volumes (confirms unless --yes)",
+    )
+    return parser
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    own_args, passthrough = split_passthrough(argv)
+    parser = build_parser()
+    args = parser.parse_args(own_args)
+    if args.yes and not args.destroy:
+        parser.error("--yes only makes sense with --destroy")
+    if passthrough and (args.demo or args.down or args.destroy):
+        parser.error("`-- args` are only used in default test mode")
+    return args, passthrough
+
+
+# --------------------------------------------------------------------------
+# Plugin dir validation
+# --------------------------------------------------------------------------
+
+
+def gather_plugin_dirs(args: argparse.Namespace) -> list[str]:
+    raw: list[str] = list(args.plugin_dir)
+    for group in args.plugins:
+        raw.extend(item.strip() for item in group.split(",") if item.strip())
+    return raw
+
+
+def find_header_file(directory: Path) -> Path | None:
+    for php in sorted(directory.glob("*.php")):
+        try:
+            head = php.read_bytes()[:HEADER_SCAN_BYTES]
+        except OSError:
+            continue
+        if PLUGIN_HEADER_RE.search(head):
+            return php
+    return None
+
+
+def resolve_plugin_dir(raw: str) -> Path:
+    candidate = Path(raw).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError(f"plugin dir not found: {raw} ({exc.strerror})") from exc
+    if not resolved.is_dir():
+        raise ValidationError(f"not a directory: {raw}")
+    return resolved
+
+
+def validate_plugin_dirs(
+    raw_dirs: list[str], *, require_test_contract: bool
+) -> list[tuple[str, Path]]:
+    seen: dict[str, Path] = {}
+    for raw in raw_dirs:
+        resolved = resolve_plugin_dir(raw)
+
+        if find_header_file(resolved) is None:
+            raise ValidationError(
+                f"plugin dir '{raw}' has no top-level *.php with a 'Plugin Name:' "
+                f"header in its first {HEADER_SCAN_BYTES // 1024} KB ({README_CONTRACT_POINTER})"
+            )
+
+        name = resolved.name
+        if name in seen and seen[name] != resolved:
+            raise ValidationError(
+                f"duplicate plugin name '{name}': '{seen[name]}' and '{resolved}' "
+                "would collide at the same mount target"
+            )
+        seen[name] = resolved
+
+        if require_test_contract:
+            missing = []
+            if not (resolved / "composer.json").is_file():
+                missing.append("composer.json")
+            if not any((resolved / f).is_file() for f in ("phpunit.xml", "phpunit.xml.dist")):
+                missing.append("phpunit.xml or phpunit.xml.dist")
+            if missing:
+                raise ValidationError(
+                    f"plugin dir '{raw}' is missing {', '.join(missing)} required for "
+                    f"test mode ({README_CONTRACT_POINTER})"
+                )
+
+    return list(seen.items())
+
+
+# --------------------------------------------------------------------------
+# Override YAML generation (string-built — no yaml dependency)
+# --------------------------------------------------------------------------
+
+
+def yaml_str(value: str) -> str:
+    """A JSON-encoded string is a valid YAML double-quoted scalar."""
+    return json.dumps(value)
+
+
+def build_override_yaml(
+    plugins: list[tuple[str, Path]],
+    *,
+    port: int,
+    persist: bool,
+    with_cache: bool,
+) -> str:
+    lines: list[str] = ["services:", "  db:"]
+    if persist:
+        lines += ["    volumes:", "      - db-data:/var/lib/mysql"]
+    else:
+        lines += ["    tmpfs:", "      - /var/lib/mysql"]
+    lines.append("")
+
+    lines += ["  wordpress:", "    ports:", f"      - {yaml_str(f'{port}:80')}"]
+    if plugins:
+        lines.append("    volumes:")
+        for name, path in plugins:
+            target = f"{path}:/var/www/html/wp-content/plugins/{name}:ro"
+            lines.append(f"      - {yaml_str(target)}")
+    lines += [
+        "    environment:",
+        "      WORDPRESS_CONFIG_EXTRA: |",
+        "        define('AUTOMATIC_UPDATER_DISABLED', true);",
+        "        define('DISALLOW_FILE_EDIT', true);",
+        "        define('WP_AUTO_UPDATE_CORE', false);",
+        "        define('WP_ENVIRONMENT_TYPE', 'local');",
+        # Always graceful: a stale object-cache.php drop-in left by a prior
+        # --with-cache run must degrade to a pass-through cache, not fatal
+        # every request (which would fail the healthcheck before seed.sh
+        # gets the chance to remove the drop-in).
+        "        define('WP_REDIS_GRACEFUL', true);",
+    ]
+    if with_cache:
+        lines.append("        define('WP_REDIS_HOST', 'valkey');")
+    lines.append("")
+
+    if plugins:
+        lines += ["  test:", "    volumes:"]
+        for name, path in plugins:
+            target = f"{path}:/mnt/plugins-src/{name}:ro"
+            lines.append(f"      - {yaml_str(target)}")
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# State persistence (for --down / --destroy to reconstruct the last run)
+# --------------------------------------------------------------------------
+
+
+def write_state(args: argparse.Namespace, plugins: list[tuple[str, Path]]) -> None:
+    payload = {
+        "plugin_dirs": [str(path) for _, path in plugins],
+        "wc_version": args.wc_version,
+        "wp_version": args.wp_version,
+        "php_version": args.php_version,
+        "port": args.port,
+        "with_cache": args.with_cache,
+        "persist": args.persist,
+    }
+    state_file_path().write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def read_state() -> dict | None:
+    path = state_file_path()
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# docker compose invocation
+# --------------------------------------------------------------------------
+
+
+def compose_env(args: argparse.Namespace, plugins: list[tuple[str, Path]]) -> dict[str, str]:
+    env = dict(os.environ)
+    if args.wp_version:
+        env["WP_BASE"] = f"wordpress:{args.wp_version}-php{args.php_version}-apache"
+    else:
+        env["WP_BASE"] = f"wordpress:php{args.php_version}-apache"
+    env["WP_VERSION"] = args.wp_version or "latest"
+    env["PHP_VERSION"] = args.php_version
+    env["WC_RUNNER_WC_VERSION"] = args.wc_version or ""
+    env["WC_RUNNER_PLUGINS"] = ",".join(name for name, _ in plugins)
+    env["WC_RUNNER_WITH_CACHE"] = "1" if args.with_cache else "0"
+    env["WC_RUNNER_PORT"] = str(args.port)
+    env["COMPOSE_PROFILES"] = "cache" if args.with_cache else ""
+    return env
+
+
+def compose_base_cmd(*, with_override: bool) -> list[str]:
+    cmd = ["docker", "compose", "-f", str(COMPOSE_FILE)]
+    if with_override and override_path().is_file():
+        cmd += ["-f", str(override_path())]
+    return cmd
+
+
+def run_compose(cmd: list[str], env: dict[str, str]) -> int:
+    if os.environ.get("WC_RUNNER_DRY_RUN"):
+        printable_env = {
+            k: v
+            for k, v in env.items()
+            if k.startswith(("WP_", "PHP_VERSION", "WC_RUNNER_", "COMPOSE_PROFILES"))
+        }
+        print("WC_RUNNER_DRY_RUN: would run:", file=sys.stderr)
+        print("  env: " + json.dumps(printable_env), file=sys.stderr)
+        print("  cmd: " + " ".join(cmd), file=sys.stderr)
+        return 0
+    result = subprocess.run(cmd, env=env)
+    return result.returncode
+
+
+# --------------------------------------------------------------------------
+# Actions
+# --------------------------------------------------------------------------
+
+
+def action_demo(args: argparse.Namespace, plugins: list[tuple[str, Path]]) -> int:
+    override_path().write_text(
+        build_override_yaml(
+            plugins, port=args.port, persist=args.persist, with_cache=args.with_cache
+        )
+    )
+    write_state(args, plugins)
+    env = compose_env(args, plugins)
+
+    # --build keeps the image in sync with docker/ (the seed scripts are
+    # baked in); a cache hit makes it a no-op on unchanged sources.
+    up_cmd = compose_base_cmd(with_override=True) + ["up", "-d", "--wait", "--build"]
+    rc = run_compose(up_cmd, env)
+    if rc != 0:
+        return rc
+
+    seed_cmd = compose_base_cmd(with_override=True) + [
+        "exec",
+        "-u",
+        "www-data",
+        "wordpress",
+        "/opt/wc-runner/seed.sh",
+        "full",
+    ]
+    return run_compose(seed_cmd, env)
+
+
+def action_test(
+    args: argparse.Namespace, plugins: list[tuple[str, Path]], passthrough: list[str]
+) -> int:
+    override_path().write_text(
+        build_override_yaml(
+            plugins, port=args.port, persist=args.persist, with_cache=args.with_cache
+        )
+    )
+    write_state(args, plugins)
+    env = compose_env(args, plugins)
+
+    # Warm the db first (mirrors odoo-runner's run-tests.sh) — `compose run`
+    # honors depends_on, but starting it explicitly gives a clearer failure
+    # if the db never becomes healthy.
+    up_cmd = compose_base_cmd(with_override=True) + ["up", "-d", "--wait", "db"]
+    rc = run_compose(up_cmd, env)
+    if rc != 0:
+        return rc
+
+    worst = 0
+    for name, _ in plugins:
+        run_cmd = compose_base_cmd(with_override=True) + [
+            "run",
+            "--rm",
+            "--build",
+            "test",
+            name,
+            *passthrough,
+        ]
+        print(f">> testing {name}", file=sys.stderr)
+        rc = run_compose(run_cmd, env)
+        worst = max(worst, rc)
+
+    return worst
+
+
+def action_down(*, destroy: bool, yes: bool) -> int:
+    state = read_state()
+    if state is None:
+        print(
+            "wc-runner: no saved run state found; tearing down with defaults",
+            file=sys.stderr,
+        )
+
+    if destroy and not yes:
+        answer = input(
+            "This deletes all woocommerce-runner volumes (wp-data, db-data, "
+            "composer-cache). Continue? [y/N] "
+        )
+        if answer.strip().lower() not in ("y", "yes"):
+            print("wc-runner: aborted", file=sys.stderr)
+            return 1
+
+    env = dict(os.environ)
+    # Teardown always activates every profile: `down -v` skips volumes that
+    # only profile-gated services reference (composer-cache ↔ test), and a
+    # stale valkey container should be removed whether or not the last run
+    # used --with-cache.
+    env["COMPOSE_PROFILES"] = "cache,test"
+
+    cmd = compose_base_cmd(with_override=True) + ["down", "--remove-orphans"]
+    if destroy:
+        cmd.append("-v")
+    rc = run_compose(cmd, env)
+
+    if destroy and rc == 0 and not os.environ.get("WC_RUNNER_DRY_RUN"):
+        override_path().unlink(missing_ok=True)
+        state_file_path().unlink(missing_ok=True)
+
+    return rc
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def main(argv: list[str]) -> int:
+    args, passthrough = parse_args(argv)
+
+    if args.destroy:
+        return action_down(destroy=True, yes=args.yes)
+    if args.down:
+        return action_down(destroy=False, yes=False)
+
+    if shutil.which("docker") is None and not os.environ.get("WC_RUNNER_DRY_RUN"):
+        print("wc-runner: docker not found on PATH", file=sys.stderr)
+        return 1
+
+    raw_dirs = gather_plugin_dirs(args)
+    if not raw_dirs and not args.demo:
+        print(
+            "wc-runner: no plugin dirs given; use -d/--plugin-dir or -p/--plugins "
+            f"({README_CONTRACT_POINTER})",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        plugins = validate_plugin_dirs(raw_dirs, require_test_contract=not args.demo)
+    except ValidationError as exc:
+        print(f"wc-runner: {exc}", file=sys.stderr)
+        return 2
+
+    if args.demo:
+        return action_demo(args, plugins)
+    return action_test(args, plugins, passthrough)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

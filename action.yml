@@ -1,0 +1,68 @@
+# Composite GitHub Action wrapper around wc-runner, so a WooCommerce
+# plugin repo can run its PHPUnit suite in CI with a single `uses:` step.
+# GitHub checks this repo out automatically as the action; the runner's
+# Ubuntu images ship Docker with compose v2, so no further setup is needed.
+name: wc-runner
+description: >-
+  Run a WooCommerce plugin's PHPUnit suite in a disposable WordPress +
+  MariaDB stack. The step's exit code is the test result.
+branding:
+  icon: shopping-cart
+  color: purple
+
+inputs:
+  plugin-dir:
+    description: Path to the plugin directory to test, relative to the workspace.
+    required: false
+    default: .
+  plugins:
+    description: Comma-separated list of additional plugin directories.
+    required: false
+    default: ""
+  wc-version:
+    description: WooCommerce version to pin. Empty installs the latest version.
+    required: false
+    default: ""
+  wp-version:
+    description: WordPress core version. Empty uses the latest version.
+    required: false
+    default: ""
+  php-version:
+    description: PHP version for the base image.
+    required: false
+    default: "8.3"
+  phpunit-args:
+    description: Extra arguments passed to phpunit (word-split on spaces).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python 3.13
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: Run plugin tests
+      shell: bash
+      # Inputs go through env vars, not inline ${{ }} interpolation, so a
+      # crafted input cannot inject shell syntax into this script.
+      env:
+        IN_PLUGIN_DIR: ${{ inputs.plugin-dir }}
+        IN_PLUGINS: ${{ inputs.plugins }}
+        IN_WC_VERSION: ${{ inputs.wc-version }}
+        IN_WP_VERSION: ${{ inputs.wp-version }}
+        IN_PHP_VERSION: ${{ inputs.php-version }}
+        IN_PHPUNIT_ARGS: ${{ inputs.phpunit-args }}
+      run: |
+        args=(-d "$IN_PLUGIN_DIR")
+        [[ -n "$IN_PLUGINS" ]] && args+=(-p "$IN_PLUGINS")
+        [[ -n "$IN_WC_VERSION" ]] && args+=(-V "$IN_WC_VERSION")
+        [[ -n "$IN_WP_VERSION" ]] && args+=(--wp-version "$IN_WP_VERSION")
+        args+=(--php-version "$IN_PHP_VERSION")
+        if [[ -n "$IN_PHPUNIT_ARGS" ]]; then
+          read -ra extra <<<"$IN_PHPUNIT_ARGS"
+          exec "$GITHUB_ACTION_PATH/wc-runner" "${args[@]}" -- "${extra[@]}"
+        fi
+        exec "$GITHUB_ACTION_PATH/wc-runner" "${args[@]}"

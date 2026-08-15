@@ -1,0 +1,16 @@
+{
+    "name": "wc-runner/hello-wc-runner",
+    "description": "Reference plugin for the wc-runner PHPUnit test contract.",
+    "type": "wordpress-plugin",
+    "license": "GPL-2.0-or-later",
+    "require-dev": {
+        "wp-phpunit/wp-phpunit": "*",
+        "yoast/phpunit-polyfills": "^2",
+        "phpunit/phpunit": "^9.6"
+    },
+    "config": {
+        "allow-plugins": {
+            "composer/installers": true
+        }
+    }
+}
